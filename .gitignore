@@ -4,3 +4,6 @@ audit_logs/
 __pycache__/
 *.pyc
 .DS_Store
+/frontend/node_modules
+/frontend/dist
+/frontend/tsconfig.tsbuildinfo

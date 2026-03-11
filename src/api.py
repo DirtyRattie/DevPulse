@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
@@ -42,9 +42,19 @@ draft_store = DraftStore()
 shared_rate_limiter = RateLimiter()
 writer_service = WriterService(draft_store, audit_logger, shared_rate_limiter)
 
+# Cached pulse result (B-3)
+_latest_pulse: Optional[PulseResult] = None
+
+REQUIRED_ENV_VARS = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # B-2: Validate required environment variables at startup
+    missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+    if missing:
+        log.error("Missing required environment variables: %s", ", ".join(missing))
+        raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
     log.info("DevPulse API started (version=%s)", __version__)
     yield
     log.info("DevPulse API shutting down")
@@ -103,8 +113,11 @@ def list_subreddits():
 def trigger_pulse(
     subreddits: Optional[list[str]] = None,
     limit: int = Query(default=25, ge=1, le=100),
+    x_operator: Optional[str] = Header(default=None),
 ):
     """Trigger a read pulse across target subreddits."""
+    global _latest_pulse
+    actor = x_operator or "system"
     start = time.monotonic()
     targets = subreddits or TARGET_SUBREDDITS
     posts = run_pulse(subreddits=targets, limit_per_sub=limit)
@@ -112,15 +125,26 @@ def trigger_pulse(
 
     audit_logger.record(
         AuditAction.READ_PULSE,
+        actor=actor,
         detail=f"subreddits={len(targets)} posts={len(posts)} duration_s={duration:.2f}",
     )
 
-    return PulseResult(
+    result = PulseResult(
         posts=[_post_to_response(p) for p in posts],
         total=len(posts),
         subreddits_scanned=targets,
         duration_s=round(duration, 2),
     )
+    _latest_pulse = result
+    return result
+
+
+@app.get("/api/pulse/latest", response_model=Optional[PulseResult])
+def get_latest_pulse():
+    """Return the most recent cached pulse result without triggering a new one."""
+    if _latest_pulse is None:
+        return PulseResult(posts=[], total=0, subreddits_scanned=[], duration_s=0)
+    return _latest_pulse
 
 
 @app.get("/api/trends", response_model=TrendReportResponse)
@@ -147,6 +171,7 @@ def export_report(
     fmt: str,
     subreddits: Optional[list[str]] = Query(default=None),
     limit: int = Query(default=25, ge=1, le=100),
+    x_operator: Optional[str] = Header(default=None),
 ):
     """Export a trend report to JSON or Markdown."""
     if fmt not in ("json", "markdown"):
@@ -155,12 +180,13 @@ def export_report(
     posts = run_pulse(subreddits=subreddits, limit_per_sub=limit)
     report = aggregate(posts)
 
+    actor = x_operator or "system"
     if fmt == "json":
         path = export_json(report)
-        audit_logger.record(AuditAction.EXPORT_JSON, detail=str(path))
+        audit_logger.record(AuditAction.EXPORT_JSON, actor=actor, detail=str(path))
     else:
         path = export_markdown(report)
-        audit_logger.record(AuditAction.EXPORT_MARKDOWN, detail=str(path))
+        audit_logger.record(AuditAction.EXPORT_MARKDOWN, actor=actor, detail=str(path))
 
     return {"status": "exported", "path": str(path)}
 
@@ -189,9 +215,10 @@ def list_reports():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/drafts", response_model=DraftResponse, status_code=201)
-def create_draft(req: DraftCreate):
+def create_draft(req: DraftCreate, x_operator: Optional[str] = Header(default=None)):
     """Create a new draft for human review before submission."""
-    draft = writer_service.create_draft(req)
+    actor = x_operator or "operator"
+    draft = writer_service.create_draft(req, actor=actor)
     return draft
 
 
@@ -210,8 +237,9 @@ def get_draft(draft_id: str):
 
 
 @app.put("/api/drafts/{draft_id}", response_model=DraftResponse)
-def update_draft(draft_id: str, req: DraftUpdate):
+def update_draft(draft_id: str, req: DraftUpdate, x_operator: Optional[str] = Header(default=None)):
     """Update a pending draft's title or body."""
+    actor = x_operator or "operator"
     draft = writer_service.drafts.get(draft_id)
     if draft is None:
         raise HTTPException(404, "Draft not found")
@@ -224,6 +252,7 @@ def update_draft(draft_id: str, req: DraftUpdate):
 
     audit_logger.record(
         AuditAction.DRAFT_UPDATE,
+        actor=actor,
         detail=f"draft={draft_id} fields={list(updates.keys())}",
     )
     updated = writer_service.drafts.update(draft_id, **updates)
@@ -249,7 +278,7 @@ def reject_draft(draft_id: str, reviewer: str = Query(...)):
 
 
 @app.post("/api/drafts/{draft_id}/submit", response_model=DraftResponse)
-def submit_draft(draft_id: str):
+def submit_draft(draft_id: str, x_operator: Optional[str] = Header(default=None)):
     """
     Submit an approved draft to Reddit.
     Requires REDDIT_USER_REFRESH_TOKEN in environment for authenticated writes.
@@ -278,8 +307,9 @@ def submit_draft(draft_id: str):
         user_agent=os.environ.get("REDDIT_USER_AGENT", f"python:devpulse:v{version}"),
     )
 
+    actor = x_operator or "system"
     try:
-        result = writer_service.submit_draft(draft_id, reddit)
+        result = writer_service.submit_draft(draft_id, reddit, actor=actor)
         if result is None:
             raise HTTPException(500, "Submission failed unexpectedly")
         return result
@@ -288,7 +318,7 @@ def submit_draft(draft_id: str):
 
 
 @app.delete("/api/drafts/{draft_id}", status_code=204)
-def delete_draft(draft_id: str):
+def delete_draft(draft_id: str, x_operator: Optional[str] = Header(default=None)):
     """Delete a draft (only pending or rejected)."""
     draft = writer_service.drafts.get(draft_id)
     if draft is None:
@@ -296,8 +326,9 @@ def delete_draft(draft_id: str):
     if draft.status in (DraftStatus.APPROVED, DraftStatus.SUBMITTED):
         raise HTTPException(400, f"Cannot delete draft in '{draft.status}' status")
 
+    actor = x_operator or "operator"
     writer_service.drafts.delete(draft_id)
-    audit_logger.record(AuditAction.DRAFT_DELETE, detail=f"draft={draft_id}")
+    audit_logger.record(AuditAction.DRAFT_DELETE, actor=actor, detail=f"draft={draft_id}")
 
 
 # ---------------------------------------------------------------------------
